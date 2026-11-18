@@ -1,0 +1,61 @@
+from machine import Pin
+import time
+
+sensor_a = Pin(11, Pin.IN, Pin.PULL_UP)
+sensor_b = Pin(10, Pin.IN, Pin.PULL_UP)
+
+first_sensor = None
+start_tick = 0
+TIMEOUT_MS = 1000  # Max ms to cross between sensors
+
+# Separate debounce tracking per sensor
+last_a_tick = 0
+last_b_tick = 0
+DEBOUNCE_MS = 80   # Ignores chatter on the SAME sensor without blocking the OTHER
+
+# Event queue flags for safe printing in main loop
+event_flag = None
+
+def handle_sensor_interrupt(pin):
+    global first_sensor, start_tick, last_a_tick, last_b_tick, event_flag
+    
+    now = time.ticks_ms()
+    
+    # Reset if previous partial crossing timed out
+    if first_sensor is not None and time.ticks_diff(now, start_tick) > TIMEOUT_MS:
+        first_sensor = None
+
+    if pin is sensor_a:
+        if time.ticks_diff(now, last_a_tick) < DEBOUNCE_MS:
+            return
+        last_a_tick = now
+        
+        if first_sensor == 'B':
+            event_flag = "ENTERING"
+            first_sensor = None
+        elif first_sensor is None:
+            first_sensor = 'A'
+            start_tick = now
+
+    elif pin is sensor_b:
+        if time.ticks_diff(now, last_b_tick) < DEBOUNCE_MS:
+            return
+        last_b_tick = now
+        
+        if first_sensor == 'A':
+            event_flag = "LEAVING"
+            first_sensor = None
+        elif first_sensor is None:
+            first_sensor = 'B'
+            start_tick = now
+
+sensor_a.irq(trigger=Pin.IRQ_FALLING, handler=handle_sensor_interrupt)
+sensor_b.irq(trigger=Pin.IRQ_FALLING, handler=handle_sensor_interrupt)
+
+print("Direction counter ready...")
+
+while True:
+    if event_flag is not None:
+        print(f"{event_flag} detected!")
+        event_flag = None
+    time.sleep_ms(10)
