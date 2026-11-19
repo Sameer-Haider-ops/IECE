@@ -1,0 +1,57 @@
+from machine import ADC, Pin, Timer
+import math
+import time
+
+adc = ADC(Pin(27))
+
+SENSITIVITY = 0.1221     # V/A (5A ACS712 scaled to 3.3V)
+ASSUMED_VOLTAGE = 230.0  # Volts (Karachi mains nominal)
+
+# Auto-calibrate integer zero offset at startup (keep load OFF)
+print("Calibrating zero offset... keep extension load off.")
+cal_sum = 0
+for _ in range(500):
+    cal_sum += adc.read_u16()
+    time.sleep_ms(2)
+ZERO_RAW = cal_sum // 500
+print(f"Baseline raw: {ZERO_RAW} ({(ZERO_RAW / 65535.0) * 3.3:.4f} V)")
+
+# Pure integer accumulators (100% interrupt & Wi-Fi safe)
+raw_sq_sum = 0
+sample_count = 0
+start_ticks = time.ticks_ms()
+
+def sample_callback(t):
+    global raw_sq_sum, sample_count
+    diff = adc.read_u16() - ZERO_RAW
+    raw_sq_sum += diff * diff
+    sample_count += 1
+
+def report_callback(t):
+    global raw_sq_sum, sample_count
+    sq_sum = raw_sq_sum
+    count = sample_count
+    raw_sq_sum = 0
+    sample_count = 0
+    
+    if count > 0:
+        rms_raw = math.sqrt(sq_sum / count)
+        rms_voltage = (rms_raw / 65535.0) * 3.3
+        rms_current = rms_voltage / SENSITIVITY
+        
+        # Filter out Pico 2 W Wi-Fi / ADC noise floor
+        if rms_current < 0.04:
+            rms_current = 0.0
+            
+        apparent_power = rms_current * ASSUMED_VOLTAGE
+        elapsed_sec = time.ticks_diff(time.ticks_ms(), start_ticks) // 1000
+        print(f"{elapsed_sec},{rms_current:.3f},{apparent_power:.2f}")
+
+timer_sample = Timer(-1)
+timer_sample.init(period=2, mode=Timer.PERIODIC, callback=sample_callback)
+
+timer_report = Timer(-1)
+timer_report.init(period=1000, mode=Timer.PERIODIC, callback=report_callback)
+
+while True:
+    time.sleep(1)
