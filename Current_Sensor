@@ -1,57 +1,88 @@
 from machine import ADC, Pin, Timer
-import math
-import time
+import utime
 
-adc = ADC(Pin(27))
+# ---------- Pin & Hardware Configuration ----------
+ADC_PIN = const(26)           # GP26 / ADC0 (shared 0.1 ohm sense resistor path)
 
-SENSITIVITY = 0.1221     # V/A (5A ACS712 scaled to 3.3V)
-ASSUMED_VOLTAGE = 230.0  # Volts (Karachi mains nominal)
+VREF = 3.3
+ADC_MAX = 65535
+VOLTS_PER_ADC = VREF / ADC_MAX
+RSENSE = 0.10                 # Ohms (shared motor return sense resistor)
 
-# Auto-calibrate integer zero offset at startup (keep load OFF)
-print("Calibrating zero offset... keep extension load off.")
-cal_sum = 0
-for _ in range(500):
-    cal_sum += adc.read_u16()
-    time.sleep_ms(2)
-ZERO_RAW = cal_sum // 500
-print(f"Baseline raw: {ZERO_RAW} ({(ZERO_RAW / 65535.0) * 3.3:.4f} V)")
+SAMPLES = const(32)
+SAMPLE_INTERVAL_US = const(500)
+POLL_PERIOD_MS = const(100)
+CHANGE_THRESHOLD = const(150)
 
-# Pure integer accumulators (100% interrupt & Wi-Fi safe)
-raw_sq_sum = 0
-sample_count = 0
-start_ticks = time.ticks_ms()
+# Calibrated ADC thresholds for ~1.8 A per motor across 0.10 ohm shunt:
+# 0 A    -> ~0
+# 1.8 A  -> ~3575 (0.18 V)
+# 3.6 A  -> ~7149 (0.36 V)
+OFF_LIMIT = const(500)        # ~0.25 A cutoff
+SINGLE_LIMIT = const(5360)    # Midpoint between 1.8 A (~3575) and 3.6 A (~7149)
 
-def sample_callback(t):
-    global raw_sq_sum, sample_count
-    diff = adc.read_u16() - ZERO_RAW
-    raw_sq_sum += diff * diff
-    sample_count += 1
+adc = ADC(Pin(ADC_PIN))
+sample_due = False
 
-def report_callback(t):
-    global raw_sq_sum, sample_count
-    sq_sum = raw_sq_sum
-    count = sample_count
-    raw_sq_sum = 0
-    sample_count = 0
-    
-    if count > 0:
-        rms_raw = math.sqrt(sq_sum / count)
-        rms_voltage = (rms_raw / 65535.0) * 3.3
-        rms_current = rms_voltage / SENSITIVITY
-        
-        # Filter out Pico 2 W Wi-Fi / ADC noise floor
-        if rms_current < 0.04:
-            rms_current = 0.0
-            
-        apparent_power = rms_current * ASSUMED_VOLTAGE
-        elapsed_sec = time.ticks_diff(time.ticks_ms(), start_ticks) // 1000
-        print(f"{elapsed_sec},{rms_current:.3f},{apparent_power:.2f}")
 
-timer_sample = Timer(-1)
-timer_sample.init(period=2, mode=Timer.PERIODIC, callback=sample_callback)
+def on_tick(_timer):
+    global sample_due
+    sample_due = True
 
-timer_report = Timer(-1)
-timer_report.init(period=1000, mode=Timer.PERIODIC, callback=report_callback)
 
-while True:
-    time.sleep(1)
+def read_adc_average():
+    total = 0
+    last_sample_us = utime.ticks_us()
+    count = 0
+
+    while count < SAMPLES:
+        now_us = utime.ticks_us()
+        if utime.ticks_diff(now_us, last_sample_us) >= SAMPLE_INTERVAL_US:
+            last_sample_us = now_us
+            total += adc.read_u16()
+            count += 1
+
+    return total // SAMPLES
+
+
+def identify_state(adc_value):
+    if adc_value < OFF_LIMIT:
+        return "BOTH OFF"
+    if adc_value < SINGLE_LIMIT:
+        return "ONE MOTOR ON (~1.8A)"
+    return "TWO MOTORS ON (~3.6A)"
+
+
+def print_reading(adc_value):
+    sense_voltage = adc_value * VOLTS_PER_ADC
+    current = sense_voltage / RSENSE
+    state = identify_state(adc_value)
+
+    print(
+        "State:", state,
+        "| ADC:", adc_value,
+        "| Vsense: {:.4f} V".format(sense_voltage),
+        "| Current: {:.3f} A".format(current),
+    )
+    return state
+
+
+timer = Timer(-1)
+timer.init(mode=Timer.PERIODIC, period=POLL_PERIOD_MS, callback=on_tick)
+
+# Initial baseline reading
+last_adc = read_adc_average()
+last_state = print_reading(last_adc)
+
+try:
+    while True:
+        if sample_due:
+            sample_due = False
+            adc_value = read_adc_average()
+            curr_state = identify_state(adc_value)
+
+            if curr_state != last_state or abs(adc_value - last_adc) >= CHANGE_THRESHOLD:
+                last_state = print_reading(adc_value)
+                last_adc = adc_value
+finally:
+    timer.deinit()
