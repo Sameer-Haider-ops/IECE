@@ -1,140 +1,157 @@
 from machine import Pin
 import time
+import Current
 
 TIMEOUT_SECONDS = 1
 EMPTY_ALERT_SECONDS = 30
-DEBOUNCE_MS = 50  # Ignore rapid re-triggers on the same sensor within 50ms
+DEBOUNCE_MS = 50
+EVENT_COOLDOWN_MS = 500
 
 # Hardware Setup (kept from project.py: A=14, B=15)
 sensor_a = Pin(14, Pin.IN, Pin.PULL_UP)
 sensor_b = Pin(15, Pin.IN, Pin.PULL_UP)
 led = Pin("LED", Pin.OUT)
 
-# State Variables
 state = {
     'first_sensor': None,
     'start_tick': 0,
-    'prev_a': sensor_a.value(),
-    'prev_b': sensor_b.value(),
     'last_a_tick': 0,
     'last_b_tick': 0,
     'timeout_ms': TIMEOUT_SECONDS * 1000,
     'people_count': 0,
     'empty_since_tick': None,
     'alert_count': 0,
-    'last_print_tick': 0
+    'last_print_tick': 0,
+    'event': None,
+    'last_event_tick': 0,
+    'timer_active': False,
+    'timer_print_step': 10,
+    'timer_completed': False
 }
 
 def keep_led_off(led_pin):
     led_pin.value(0)
 
-def check_edge_transition(curr, prev):
-    return (prev == 1 and curr == 0)
-
-def check_timeout(first_sens, start, timeout):
-    if first_sens is not None:
-        if time.ticks_diff(time.ticks_ms(), start) > timeout:
-            return None
-    return first_sens
-
-def evaluate_sensors(s_a, s_b, current_state):
-    curr_a = s_a.value()
-    curr_b = s_b.value()
+def handle_sensor_interrupt(pin):
     now = time.ticks_ms()
 
-    current_state['first_sensor'] = check_timeout(
-        current_state['first_sensor'],
-        current_state['start_tick'],
-        current_state['timeout_ms']
-    )
+    if state['first_sensor'] is not None:
+        if time.ticks_diff(now, state['start_tick']) > state['timeout_ms']:
+            state['first_sensor'] = None
 
-    a_triggered = check_edge_transition(curr_a, current_state['prev_a'])
-    b_triggered = check_edge_transition(curr_b, current_state['prev_b'])
+    if pin is sensor_a:
+        sensor_name = 'A'
+        last_tick_name = 'last_a_tick'
+    else:
+        sensor_name = 'B'
+        last_tick_name = 'last_b_tick'
 
-    # Debounce filter (kept from project.py)
-    if a_triggered:
-        if time.ticks_diff(now, current_state['last_a_tick']) < DEBOUNCE_MS:
-            a_triggered = False
-        else:
-            current_state['last_a_tick'] = now
+    if time.ticks_diff(now, state[last_tick_name]) < DEBOUNCE_MS:
+        return
+    state[last_tick_name] = now
 
-    if b_triggered:
-        if time.ticks_diff(now, current_state['last_b_tick']) < DEBOUNCE_MS:
-            b_triggered = False
-        else:
-            current_state['last_b_tick'] = now
+    first_sensor = state['first_sensor']
+    if first_sensor is None:
+        state['first_sensor'] = sensor_name
+        state['start_tick'] = now
+        return
 
-    # Detect Sensor A Trigger (1 -> 0)
-    if a_triggered:
-        if current_state['first_sensor'] == 'B':
-            current_state['prev_a'] = curr_a
-            current_state['prev_b'] = curr_b
-            return "LEAVING"
-        elif current_state['first_sensor'] is None:
-            current_state['first_sensor'] = 'A'
-            current_state['start_tick'] = now
+    if first_sensor == sensor_name:
+        return
 
-    # Detect Sensor B Trigger (1 -> 0)
-    if b_triggered:
-        if current_state['first_sensor'] == 'A':
-            current_state['prev_a'] = curr_a
-            current_state['prev_b'] = curr_b
-            return "ENTERING"
-        elif current_state['first_sensor'] is None:
-            current_state['first_sensor'] = 'B'
-            current_state['start_tick'] = now
+    if state['event'] is None:
+        if time.ticks_diff(now, state['last_event_tick']) >= EVENT_COOLDOWN_MS:
+            if first_sensor == 'A' and sensor_name == 'B':
+                state['event'] = "ENTERING"
+                state['last_event_tick'] = now
+            elif first_sensor == 'B' and sensor_name == 'A':
+                state['event'] = "LEAVING"
+                state['last_event_tick'] = now
 
-    current_state['prev_a'] = curr_a
-    current_state['prev_b'] = curr_b
-    return None
+    state['first_sensor'] = None
 
-print("Door Monitor Started...")
+sensor_a.irq(trigger=Pin.IRQ_FALLING, handler=handle_sensor_interrupt)
+sensor_b.irq(trigger=Pin.IRQ_FALLING, handler=handle_sensor_interrupt)
 
-# Main Loop
-while True:
-    keep_led_off(led)
-    now = time.ticks_ms()
-
-    direction = evaluate_sensors(sensor_a, sensor_b, state)
-
+def process_event(direction):
     if direction == "ENTERING":
         state['people_count'] += 1
         print("Entering - People inside:", state['people_count'])
         state['empty_since_tick'] = None
         state['alert_count'] = 0
-        state['first_sensor'] = None
+        state['timer_active'] = False
+        state['timer_print_step'] = 10
+        state['timer_completed'] = False
     elif direction == "LEAVING":
         if state['people_count'] > 0:
             state['people_count'] -= 1
             print("Leaving - People inside:", state['people_count'])
             if state['people_count'] == 0:
                 print("Room is empty")
-                state['empty_since_tick'] = now
+                state['empty_since_tick'] = time.ticks_ms()
                 state['alert_count'] = 0
-        state['first_sensor'] = None
-
-    # Empty room tracking & terminal timer output
-    if state['people_count'] == 0:
-        if state['empty_since_tick'] is None:
-            state['empty_since_tick'] = now
-            state['alert_count'] = 0
+                state['timer_active'] = True
+                state['timer_print_step'] = 10
+                state['timer_completed'] = False
         else:
-            elapsed_ms = time.ticks_diff(now, state['empty_since_tick'])
-            elapsed_sec = elapsed_ms // 1000
-            remaining_sec = EMPTY_ALERT_SECONDS - (elapsed_sec % EMPTY_ALERT_SECONDS)
+            print("Ignoring exit: room is already empty")
 
-            if time.ticks_diff(now, state['last_print_tick']) >= 1000:
-                if remaining_sec > 0:
-                    print(f"Room empty timer: {remaining_sec}s remaining...")
-                state['last_print_tick'] = now
-
-            if elapsed_ms >= EMPTY_ALERT_SECONDS * 1000:
-                state['alert_count'] += 1
-                total_empty_sec = state['alert_count'] * EMPTY_ALERT_SECONDS
-                print(f"\aALERT: Room has been empty for {total_empty_sec} seconds")
-                state['empty_since_tick'] += EMPTY_ALERT_SECONDS * 1000
-    else:
+def update_empty_timer(now):
+    if state['people_count'] != 0:
         state['empty_since_tick'] = None
         state['alert_count'] = 0
+        state['timer_active'] = False
+        state['timer_print_step'] = 10
+        return
 
-    time.sleep_ms(10)
+    if state['timer_completed']:
+        return
+
+    if state['empty_since_tick'] is None:
+        state['empty_since_tick'] = now
+        state['timer_active'] = True
+
+    if not state['timer_active']:
+        return
+
+    elapsed_ms = time.ticks_diff(now, state['empty_since_tick'])
+    elapsed_sec = elapsed_ms // 1000
+    print_step = state['timer_print_step']
+
+    if elapsed_sec >= print_step and print_step < EMPTY_ALERT_SECONDS:
+        print(f"Room empty timer: {print_step}s")
+        state['timer_print_step'] += 10
+
+    if elapsed_ms >= EMPTY_ALERT_SECONDS * 1000:
+        print("\aALERT: Room has been empty for 30 seconds")
+        state['timer_active'] = False
+        state['empty_since_tick'] = None
+        state['timer_completed'] = True
+
+print("Door Monitor Started...")
+
+def main():
+    Current.init_current_sensor()
+    last_current_send_tick = time.ticks_ms()
+
+    while True:
+        keep_led_off(led)
+        now = time.ticks_ms()
+
+        if state['event'] is not None:
+            direction = state['event']
+            state['event'] = None
+            process_event(direction)
+
+        update_empty_timer(now)
+
+        if time.ticks_diff(now, last_current_send_tick) >= 1000:
+            payload = Current.read_current()
+            Current.print_current_text(payload)
+            Current.print_current_json(payload)
+            last_current_send_tick = now
+
+        time.sleep_ms(10)
+
+if __name__ == "__main__":
+    main()
